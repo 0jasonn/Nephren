@@ -23,8 +23,15 @@ Use whichever loader your development tool exposes:
 local Nephren = loadstring(readfile("src/Nephren.lua"))()
 ```
 
-The host must provide `Drawing`, `Vector2`, `Color3`, `Enum`, `game:GetService`,
-`UserInputService`, and `RunService`.
+The host must provide the custom `Drawing` API alongside the standard Roblox/Luau
+runtime: `Vector2`, `Rect`, `Color3`, `Enum`, `game:GetService`,
+`UserInputService`, `RunService`, and `Workspace`.
+
+Outside of rendering, Nephren uses native Roblox/Luau APIs where they fit:
+`UserInputService` supplies mouse state and keyboard-layout-aware key names,
+`Workspace.CurrentCamera` supplies the viewport, Roblox datatypes handle geometry
+and color conversion, and the Luau `math`, `table`, and `utf8` libraries handle
+their corresponding operations.
 
 ## Basic structure
 
