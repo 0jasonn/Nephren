@@ -1,5 +1,43 @@
-local librarySource = readfile("Nephren.luau")
-local Nephren = assert(loadstring(librarySource), "failed to compile Nephren")()
+local NEPHREN_LIBRARY_PATH = "Nephren.luau"
+local NEPHREN_LIBRARY_URLS = {
+    "https://raw.githubusercontent.com/jasonm066/nephren/main/src/ui/Nephren.luau",
+    "https://raw.githubusercontent.com/jasonm066/nephren/main/src/Nephren.luau",
+}
+
+local function fetchNephrenLibrary()
+    assert(type(loadstring) == "function", "executor loadstring API is unavailable")
+    assert(type(writefile) == "function", "executor writefile API is unavailable")
+
+    local failures = {}
+    local cacheBuster = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock() * 1000000))
+
+    for _, url in ipairs(NEPHREN_LIBRARY_URLS) do
+        local downloaded, sourceOrFailure = pcall(function()
+            return game:HttpGet(url .. "?cacheBust=" .. cacheBuster)
+        end)
+
+        if downloaded and type(sourceOrFailure) == "string" and sourceOrFailure ~= "" then
+            local chunk, compileFailure = loadstring(sourceOrFailure)
+
+            if chunk then
+                local saved, saveResult = pcall(writefile, NEPHREN_LIBRARY_PATH, sourceOrFailure)
+                assert(
+                    saved and saveResult ~= false,
+                    "failed to save Nephren.luau: " .. tostring(saveResult)
+                )
+                return chunk
+            end
+
+            table.insert(failures, url .. ": " .. tostring(compileFailure))
+        else
+            table.insert(failures, url .. ": " .. tostring(sourceOrFailure))
+        end
+    end
+
+    error("failed to download Nephren.luau: " .. table.concat(failures, "; "), 0)
+end
+
+local Nephren = fetchNephrenLibrary()()
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
