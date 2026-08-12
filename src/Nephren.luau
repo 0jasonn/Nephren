@@ -34,6 +34,14 @@ local COLOR_PICKER_POPUP_HEIGHT = 224
 local COLOR_PICKER_POPUP_WIDTH = 180
 local COLOR_VALUE_SEGMENTS = 32
 local COLOR_WHITE = Color3.new(1, 1, 1)
+local CONFIG_EXTENSION = ".json"
+local CONFIG_FORMAT = "NephrenConfig"
+local CONFIG_MAX_BYTES = 1024 * 1024
+local CONFIG_MAX_DEPTH = 32
+local CONFIG_MAX_FLAGS = 512
+local CONFIG_TYPE_FIELD = "__nephrenType"
+local CONFIG_VERSION = 1
+local DEFAULT_CONFIG_FOLDER = "Nephren/configs"
 
 local DEFAULT_THEME = {
 	Background = Color3.fromRGB(17, 17, 17),
@@ -101,9 +109,36 @@ local SHIFT_KEYS = {
 }
 
 local Nephren = {
-	Version = "1.0.0",
+	Version = "1.1.0",
 	Flags = {},
+	ConfigFolder = DEFAULT_CONFIG_FOLDER,
+	-- These host-provided fields are initialized during startup.
+	_defaultFont = nil :: any,
+	_drawingNew = nil :: any,
 }
+
+local HostDrawing: any = Drawing
+local HostEnvironment: any = _G
+local ChunkEnvironment: any = _G
+local environmentProvider: any = getgenv
+if type(environmentProvider) == "function" then
+	local resolved, environment = pcall(environmentProvider)
+	if resolved and type(environment) == "table" then
+		HostEnvironment = environment
+	end
+end
+environmentProvider = getfenv
+if type(environmentProvider) == "function" then
+	local resolved, environment = pcall(environmentProvider)
+	if resolved and type(environment) == "table" then
+		ChunkEnvironment = environment
+	end
+end
+-- Drawing is supplied by the script-executor host rather than Roblox Luau.
+local DrawingApi: any = HostEnvironment.Drawing
+	or ChunkEnvironment.Drawing
+	or _G.Drawing
+	or HostDrawing
 
 local Window = {}
 Window.__index = Window
@@ -283,8 +318,8 @@ local function getFont(theme)
 	if Nephren._defaultFont ~= nil then
 		return Nephren._defaultFont
 	end
-	if Drawing.Fonts then
-		return Drawing.Fonts.Plex or Drawing.Fonts.UI or 2
+	if DrawingApi.Fonts then
+		return DrawingApi.Fonts.Plex or DrawingApi.Fonts.UI or 2
 	end
 	return 2
 end
@@ -1016,13 +1051,13 @@ function Nephren:_unindexKeybind(keybind, token)
 	end
 end
 
-function Nephren:_setKeybindToken(keybind, token)
+function Nephren:_setKeybindToken(keybind, token, silent)
 	local previous = keybind.Value
 	if previous == token then
 		return false
 	end
 	if keybind.Mode == "Hold" and keybind.State then
-		keybind:_inputEnded()
+		keybind:_inputEnded(silent)
 		if keybind._destroyed then
 			return false
 		end
@@ -1408,15 +1443,15 @@ function Nephren:_start()
 		return
 	end
 
-	assert(Drawing and Drawing.new, "Nephren requires Drawing.new")
+	assert(DrawingApi and DrawingApi.new, "Nephren requires Drawing.new")
 
 	self._userInputService = UserInputService
 	self._runService = RunService
 	self._workspace = Workspace
-	self._drawingNew = Drawing.new
+	self._drawingNew = DrawingApi.new
 	self._defaultFont = 2
-	if Drawing.Fonts then
-		self._defaultFont = Drawing.Fonts.Plex or Drawing.Fonts.UI or 2
+	if DrawingApi.Fonts then
+		self._defaultFont = DrawingApi.Fonts.Plex or DrawingApi.Fonts.UI or 2
 	end
 	self._started = true
 
@@ -2000,6 +2035,787 @@ function Window:_unregisterFlag(owner, flag)
 	end
 end
 
+local configHttpService
+
+local function getHostFunction(name)
+	local candidate = HostEnvironment[name]
+	if type(candidate) ~= "function" then
+		candidate = ChunkEnvironment[name]
+	end
+	if type(candidate) ~= "function" then
+		candidate = _G[name]
+	end
+	if type(candidate) == "function" then
+		return candidate
+	end
+	return nil
+end
+
+local function getConfigHttpService()
+	if configHttpService then
+		return configHttpService
+	end
+	local succeeded, service = pcall(game.GetService, game, "HttpService")
+	if not succeeded then
+		return nil, "HttpService is unavailable: " .. tostring(service)
+	end
+	configHttpService = service
+	return service
+end
+
+local function trim(text)
+	return string.match(text, "^%s*(.-)%s*$")
+end
+
+local function isReservedWindowsName(name)
+	local base = string.upper(string.match(name, "^([^.]+)") or name)
+	return base == "CON"
+		or base == "PRN"
+		or base == "AUX"
+		or base == "NUL"
+		or string.match(base, "^COM[1-9]$") ~= nil
+		or string.match(base, "^LPT[1-9]$") ~= nil
+end
+
+local function normalizeConfigName(name)
+	if type(name) ~= "string" then
+		return nil, "config name must be a string"
+	end
+	name = trim(name)
+	if string.lower(string.sub(name, -#CONFIG_EXTENSION)) == CONFIG_EXTENSION then
+		name = trim(string.sub(name, 1, #name - #CONFIG_EXTENSION))
+	end
+	if name == "" then
+		return nil, "config name cannot be empty"
+	end
+	if #name > 64 then
+		return nil, "config name cannot exceed 64 bytes"
+	end
+	if not string.match(name, "^[A-Za-z0-9_-]+$") then
+		return nil, "config name may only contain letters, numbers, '_' and '-'"
+	end
+	if isReservedWindowsName(name) then
+		return nil, "config name is reserved by the host filesystem"
+	end
+	return name
+end
+
+local function getConfigFolder()
+	local folder = Nephren.ConfigFolder
+	if type(folder) ~= "string" then
+		return nil, "Nephren.ConfigFolder must be a string"
+	end
+	folder = string.gsub(folder, "\\", "/")
+	folder = trim(folder)
+	folder = string.gsub(folder, "/+", "/")
+	folder = string.gsub(folder, "/$", "")
+	if folder == "" then
+		return nil, "Nephren.ConfigFolder cannot be empty"
+	end
+	if string.sub(folder, 1, 1) == "/"
+		or string.match(folder, "^%a:/")
+		or string.find(folder, "[%c:*?\"<>|]")
+	then
+		return nil, "Nephren.ConfigFolder must be a safe relative path"
+	end
+	for segment in string.gmatch(folder, "[^/]+") do
+		if segment == "." or segment == ".." then
+			return nil, "Nephren.ConfigFolder cannot contain '.' or '..' segments"
+		end
+		if string.match(segment, "[%. ]$") or isReservedWindowsName(segment) then
+			return nil, "Nephren.ConfigFolder contains an unsupported path segment"
+		end
+	end
+	return folder
+end
+
+local function getConfigPath(name)
+	local normalizedName, nameFailure = normalizeConfigName(name)
+	if not normalizedName then
+		return nil, nameFailure
+	end
+	local folder, folderFailure = getConfigFolder()
+	if folder == nil then
+		return nil, folderFailure
+	end
+	return folder .. "/" .. normalizedName .. CONFIG_EXTENSION, normalizedName
+end
+
+local function ensureConfigFolder(folder)
+	local makeFolder = getHostFunction("makefolder")
+	local isFolder = getHostFunction("isfolder")
+	if not makeFolder then
+		return true
+	end
+	local current = ""
+	for segment in string.gmatch(folder, "[^/]+") do
+		current = current == "" and segment or current .. "/" .. segment
+		local exists = false
+		if isFolder then
+			local checked, result = pcall(isFolder, current)
+			exists = checked and result == true
+		end
+		if not exists then
+			local created, failure = pcall(makeFolder, current)
+			if not created or failure == false then
+				local recovered = false
+				if isFolder then
+					local checked, result = pcall(isFolder, current)
+					recovered = checked and result == true
+				end
+				if not recovered then
+					return false, "failed to create config folder: " .. tostring(failure)
+				end
+			end
+		end
+	end
+	return true
+end
+
+local function finiteNumber(value)
+	return value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function denseArrayLength(value)
+	local count = 0
+	local maximum = 0
+	for key in pairs(value) do
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+			return nil
+		end
+		count = count + 1
+		maximum = math.max(maximum, key)
+	end
+	if maximum ~= count then
+		return nil
+	end
+	return count
+end
+
+local function configEnumIdentifier(value)
+	if type(value) ~= "string" then
+		return nil
+	end
+	return string.match(value, "^Enum%.([%a_][%w_]*)$")
+		or string.match(value, "^([%a_][%w_]*)$")
+end
+
+local function resolveConfigEnumItem(enumTypeName, itemName)
+	if type(enumTypeName) ~= "string"
+		or type(itemName) ~= "string"
+		or not string.match(enumTypeName, "^[%a_][%w_]*$")
+		or not string.match(itemName, "^[%a_][%w_]*$")
+	then
+		return nil
+	end
+	local succeeded, item = pcall(function()
+		local enumType = Enum[enumTypeName]
+		return enumType and enumType[itemName]
+	end)
+	if not succeeded or typeof(item) ~= "EnumItem" then
+		return nil
+	end
+	return item
+end
+
+local function configEnumItemParts(value)
+	local converted, itemText = pcall(tostring, value)
+	if converted then
+		local enumType, itemName = string.match(
+			itemText,
+			"^Enum%.([%a_][%w_]*)%.([%a_][%w_]*)$"
+		)
+		if enumType and resolveConfigEnumItem(enumType, itemName) == value then
+			return enumType, itemName
+		end
+	end
+
+	local readParts, enumTypeValue, itemName = pcall(function()
+		return value.EnumType, value.Name
+	end)
+	if readParts and type(itemName) == "string" then
+		local convertedType, typeText = pcall(tostring, enumTypeValue)
+		if convertedType then
+			local enumType = configEnumIdentifier(typeText)
+			if enumType and resolveConfigEnumItem(enumType, itemName) == value then
+				return enumType, itemName
+			end
+		end
+		local readTypeName, typeName = pcall(function()
+			return enumTypeValue.Name
+		end)
+		if readTypeName then
+			local enumType = configEnumIdentifier(typeName)
+			if enumType and resolveConfigEnumItem(enumType, itemName) == value then
+				return enumType, itemName
+			end
+		end
+	end
+
+	return nil
+end
+
+local function encodeConfigValue(value, ancestors, depth)
+	if depth > CONFIG_MAX_DEPTH then
+		return false, "value nesting exceeds " .. CONFIG_MAX_DEPTH .. " levels"
+	end
+	local valueType = typeof(value)
+	if value == nil then
+		return true, { [CONFIG_TYPE_FIELD] = "Nil" }
+	elseif valueType == "boolean" or valueType == "string" then
+		return true, value
+	elseif valueType == "number" then
+		if not finiteNumber(value) then
+			return false, "non-finite numbers are unsupported"
+		end
+		return true, value
+	elseif valueType == "Color3" then
+		return true, {
+			[CONFIG_TYPE_FIELD] = "Color3",
+			R = value.R,
+			G = value.G,
+			B = value.B,
+		}
+	elseif valueType == "EnumItem" then
+		local enumType, itemName = configEnumItemParts(value)
+		if not enumType or not itemName then
+			return false, "enum item could not be identified"
+		end
+		return true, {
+			[CONFIG_TYPE_FIELD] = "EnumItem",
+			Enum = enumType,
+			Name = itemName,
+		}
+	elseif valueType ~= "table" then
+		return false, valueType .. " values are unsupported"
+	end
+	if ancestors[value] then
+		return false, "cyclic tables are unsupported"
+	end
+	ancestors[value] = true
+	local entries = {}
+	for key, nestedValue in pairs(value) do
+		local keyType = typeof(key)
+		if keyType ~= "boolean" and keyType ~= "string" and keyType ~= "number" then
+			ancestors[value] = nil
+			return false, "table keys must be booleans, strings, or finite numbers"
+		end
+		local keySucceeded, encodedKey = encodeConfigValue(key, ancestors, depth + 1)
+		if not keySucceeded then
+			ancestors[value] = nil
+			return false, "table key: " .. tostring(encodedKey)
+		end
+		local valueSucceeded, encodedValue = encodeConfigValue(
+			nestedValue,
+			ancestors,
+			depth + 1
+		)
+		if not valueSucceeded then
+			ancestors[value] = nil
+			return false, "table value: " .. tostring(encodedValue)
+		end
+		entries[#entries + 1] = {
+			Key = encodedKey,
+			Value = encodedValue,
+		}
+	end
+	ancestors[value] = nil
+	return true, {
+		[CONFIG_TYPE_FIELD] = "Table",
+		Entries = entries,
+	}
+end
+
+local function decodeConfigValue(encoded, depth)
+	if depth > CONFIG_MAX_DEPTH then
+		return false, "value nesting exceeds " .. CONFIG_MAX_DEPTH .. " levels"
+	end
+	local encodedType = type(encoded)
+	if encodedType == "boolean" or encodedType == "string" then
+		return true, encoded
+	elseif encodedType == "number" then
+		if not finiteNumber(encoded) then
+			return false, "non-finite numbers are unsupported"
+		end
+		return true, encoded
+	elseif encodedType ~= "table" then
+		return false, "invalid encoded value"
+	end
+	local tag = encoded[CONFIG_TYPE_FIELD]
+	if tag == "Nil" then
+		return true, nil
+	elseif tag == "Color3" then
+		if type(encoded.R) ~= "number"
+			or type(encoded.G) ~= "number"
+			or type(encoded.B) ~= "number"
+			or not finiteNumber(encoded.R)
+			or not finiteNumber(encoded.G)
+			or not finiteNumber(encoded.B)
+			or encoded.R < 0
+			or encoded.R > 1
+			or encoded.G < 0
+			or encoded.G > 1
+			or encoded.B < 0
+			or encoded.B > 1
+		then
+			return false, "invalid Color3 value"
+		end
+		return true, Color3.new(encoded.R, encoded.G, encoded.B)
+	elseif tag == "EnumItem" then
+		if type(encoded.Enum) ~= "string" or type(encoded.Name) ~= "string" then
+			return false, "invalid EnumItem value"
+		end
+		local enumItem = resolveConfigEnumItem(encoded.Enum, encoded.Name)
+		if enumItem == nil then
+			return false, "unknown enum item Enum."
+				.. encoded.Enum
+				.. "."
+				.. encoded.Name
+		end
+		return true, enumItem
+	elseif tag ~= "Table" or type(encoded.Entries) ~= "table" then
+		return false, "unknown encoded value type"
+	end
+	if not denseArrayLength(encoded.Entries) then
+		return false, "config table entries must be a dense array"
+	end
+	local result = {}
+	local seenKeys = {}
+	for index, entry in ipairs(encoded.Entries) do
+		if type(entry) ~= "table" then
+			return false, "invalid table entry at index " .. index
+		end
+		local keySucceeded, key = decodeConfigValue(entry.Key, depth + 1)
+		if not keySucceeded then
+			return false, "table key: " .. tostring(key)
+		end
+		if key == nil then
+			return false, "table keys cannot be nil"
+		end
+		local keyType = type(key)
+		if keyType ~= "boolean" and keyType ~= "string" and keyType ~= "number" then
+			return false, "table keys must be booleans, strings, or finite numbers"
+		end
+		local valueSucceeded, value = decodeConfigValue(entry.Value, depth + 1)
+		if not valueSucceeded then
+			return false, "table value: " .. tostring(value)
+		end
+		if value == nil then
+			return false, "table values cannot be nil"
+		end
+		if seenKeys[key] then
+			return false, "config table contains a duplicate key"
+		end
+		seenKeys[key] = true
+		result[key] = value
+	end
+	return true, result
+end
+
+local function collectConfigValues(controls)
+	local flags = {}
+	for flag, control in pairs(controls) do
+		if type(flag) == "string"
+			and control
+			and not control._destroyed
+			and control.Persistable ~= false
+			and type(control.GetValue) == "function"
+			and type(control.SetValue) == "function"
+		then
+			flags[#flags + 1] = flag
+			if #flags > CONFIG_MAX_FLAGS then
+				return nil, "config cannot contain more than " .. CONFIG_MAX_FLAGS .. " flags"
+			end
+		end
+	end
+	table.sort(flags)
+	local values = {}
+	for _, flag in ipairs(flags) do
+		local control = controls[flag]
+		local readSucceeded, value = pcall(control.GetValue, control)
+		if not readSucceeded then
+			return nil, "failed to read flag '" .. flag .. "': " .. tostring(value)
+		end
+		local encoded, result = encodeConfigValue(value, {}, 0)
+		if not encoded then
+			return nil, "failed to encode flag '" .. flag .. "': " .. tostring(result)
+		end
+		values[#values + 1] = {
+			Flag = flag,
+			Value = result,
+		}
+	end
+	return values
+end
+
+local function saveConfig(controls, name)
+	local path, normalizedName = getConfigPath(name)
+	if not path then
+		return false, normalizedName
+	end
+	local writeFile = getHostFunction("writefile")
+	if not writeFile then
+		return false, "executor writefile API is unavailable"
+	end
+	local values, valueFailure = collectConfigValues(controls)
+	if not values then
+		return false, valueFailure
+	end
+	local httpService, serviceFailure = getConfigHttpService()
+	if not httpService then
+		return false, serviceFailure
+	end
+	local encoded, contents = pcall(httpService.JSONEncode, httpService, {
+		Format = CONFIG_FORMAT,
+		Version = CONFIG_VERSION,
+		Values = values,
+	})
+	if not encoded or type(contents) ~= "string" then
+		return false, "failed to encode config: " .. tostring(contents)
+	end
+	if #contents > CONFIG_MAX_BYTES then
+		return false, "config exceeds the " .. CONFIG_MAX_BYTES .. " byte limit"
+	end
+	local folder, folderFailure = getConfigFolder()
+	if folder == nil then
+		return false, folderFailure
+	end
+	local folderReady, createFailure = ensureConfigFolder(folder)
+	if folderReady == false then
+		return false, createFailure
+	end
+	local written, writeFailure = pcall(writeFile, path, contents)
+	if not written or writeFailure == false then
+		return false, "failed to write config: " .. tostring(writeFailure)
+	end
+	return true, #values, normalizedName
+end
+
+local function readConfig(name)
+	local path, normalizedName = getConfigPath(name)
+	if not path then
+		return nil, normalizedName
+	end
+	local isFile = getHostFunction("isfile")
+	if isFile then
+		local checked, exists = pcall(isFile, path)
+		if checked and not exists then
+			return nil, "config '" .. normalizedName .. "' does not exist"
+		end
+	end
+	local readFile = getHostFunction("readfile")
+	if not readFile then
+		return nil, "executor readfile API is unavailable"
+	end
+	local read, contents = pcall(readFile, path)
+	if not read then
+		return nil, "failed to read config: " .. tostring(contents)
+	end
+	if type(contents) ~= "string" then
+		return nil, "config file did not contain text"
+	end
+	if #contents > CONFIG_MAX_BYTES then
+		return nil, "config exceeds the " .. CONFIG_MAX_BYTES .. " byte limit"
+	end
+	local httpService, serviceFailure = getConfigHttpService()
+	if not httpService then
+		return nil, serviceFailure
+	end
+	local decoded, payload = pcall(httpService.JSONDecode, httpService, contents)
+	if not decoded then
+		return nil, "failed to decode config: " .. tostring(payload)
+	end
+	if type(payload) ~= "table"
+		or payload.Format ~= CONFIG_FORMAT
+		or payload.Version ~= CONFIG_VERSION
+		or type(payload.Values) ~= "table"
+	then
+		return nil, "unsupported or malformed Nephren config"
+	end
+	if not denseArrayLength(payload.Values) then
+		return nil, "config values must be a dense array"
+	end
+	if #payload.Values > CONFIG_MAX_FLAGS then
+		return nil, "config cannot contain more than " .. CONFIG_MAX_FLAGS .. " flags"
+	end
+	return payload, normalizedName
+end
+
+local function configValuesEqual(first, second, depth)
+	if first == second then
+		return true
+	end
+	if type(first) ~= "table" or type(second) ~= "table" or depth > CONFIG_MAX_DEPTH then
+		return false
+	end
+	local count = 0
+	for key, value in pairs(first) do
+		if not configValuesEqual(value, second[key], depth + 1) then
+			return false
+		end
+		count = count + 1
+	end
+	local secondCount = 0
+	for _ in pairs(second) do
+		secondCount = secondCount + 1
+	end
+	return count == secondCount
+end
+
+local function configValueCompatible(control, value)
+	local controlType = getmetatable(control)
+	if controlType == Checkbox then
+		return type(value) == "boolean"
+	elseif controlType == Slider or controlType == Spinner then
+		return type(value) == "number" and finiteNumber(value)
+	elseif controlType == Textbox then
+		return type(value) == "string"
+	elseif controlType == Dropdown or controlType == Listbox then
+		return value == nil or control.AllowUnknown or table.find(control.Values, value) ~= nil
+	elseif controlType == MultiDropdown then
+		return type(value) == "table" and denseArrayLength(value) ~= nil
+	elseif controlType == ColorPickerAddon or controlType == StandaloneColorPicker then
+		return typeof(value) == "Color3"
+	elseif controlType == KeybindAddon or controlType == StandaloneKeybind then
+		if value == nil then
+			return true
+		end
+		if typeof(value) ~= "EnumItem" then
+			return false
+		end
+		return value.EnumType == Enum.KeyCode
+			or value == Enum.UserInputType.MouseButton1
+			or value == Enum.UserInputType.MouseButton2
+			or value == Enum.UserInputType.MouseButton3
+	end
+	return true
+end
+
+local function loadConfig(controls, name, silent, scopeWindow)
+	local payload, readFailure = readConfig(name)
+	if not payload then
+		return false, readFailure
+	end
+	local staged = {}
+	local seenFlags = {}
+	for index, entry in ipairs(payload.Values) do
+		if type(entry) ~= "table" or type(entry.Flag) ~= "string" then
+			return false, "invalid config entry at index " .. index
+		end
+		if seenFlags[entry.Flag] then
+			return false, "config contains duplicate flag '" .. entry.Flag .. "'"
+		end
+		seenFlags[entry.Flag] = true
+		local decoded, value = decodeConfigValue(entry.Value, 0)
+		if not decoded then
+			return false, "failed to decode flag '" .. entry.Flag .. "': " .. tostring(value)
+		end
+		staged[#staged + 1] = {
+			Flag = entry.Flag,
+			Value = value,
+		}
+	end
+	table.sort(staged, function(first, second)
+		return first.Flag < second.Flag
+	end)
+	for _, keybind in ipairs(Nephren._keybinds) do
+		if not keybind._destroyed
+			and (scopeWindow == nil or keybind._window == scopeWindow)
+			and keybind.Mode == "Hold"
+			and keybind.State
+		then
+			keybind:_inputEnded(silent == true)
+		end
+	end
+	local applied = 0
+	local skipped = 0
+	local appliedControls = {}
+
+	local function restore(snapshot)
+		if snapshot.Control and not snapshot.Control._destroyed then
+			pcall(snapshot.Control.SetValue, snapshot.Control, snapshot.PreviousValue, true)
+		end
+		local window = snapshot.Control and snapshot.Control._window
+		if window and not window._destroyed then
+			window._flagControls[snapshot.Flag] = snapshot.WindowOwner
+			if snapshot.WindowOwner and not snapshot.WindowOwner._destroyed then
+				local read, value = pcall(snapshot.WindowOwner.GetValue, snapshot.WindowOwner)
+				window.Flags[snapshot.Flag] = read and value or nil
+			else
+				window.Flags[snapshot.Flag] = nil
+			end
+		end
+		Nephren._flagOwners[snapshot.Flag] = snapshot.GlobalOwner
+		if snapshot.GlobalOwner and not snapshot.GlobalOwner._destroyed then
+			local read, value = pcall(snapshot.GlobalOwner.GetValue, snapshot.GlobalOwner)
+			Nephren.Flags[snapshot.Flag] = read and value or nil
+		else
+			Nephren.Flags[snapshot.Flag] = nil
+		end
+	end
+
+	local function rollback(extraSnapshot)
+		if extraSnapshot then
+			restore(extraSnapshot)
+		end
+		for index = #appliedControls, 1, -1 do
+			restore(appliedControls[index])
+		end
+	end
+
+	for _, entry in ipairs(staged) do
+		local control = controls[entry.Flag]
+		if not control
+			or control._destroyed
+			or control.Persistable == false
+			or type(control.SetValue) ~= "function"
+			or not configValueCompatible(control, entry.Value)
+		then
+			skipped = skipped + 1
+		else
+			local previousRead, previousResult = pcall(control.GetValue, control)
+			if not previousRead then
+				rollback()
+				return false,
+					"failed to read flag '" .. entry.Flag .. "': " .. tostring(previousResult),
+					0,
+					skipped
+			end
+			local snapshot = {
+				Control = control,
+				Flag = entry.Flag,
+				GlobalOwner = Nephren._flagOwners[entry.Flag],
+				PreviousValue = previousResult,
+				WindowOwner = control._window and control._window._flagControls[entry.Flag],
+			}
+			local succeeded, failure = pcall(
+				control.SetValue,
+				control,
+				entry.Value,
+				true
+			)
+			if not succeeded then
+				rollback(snapshot)
+				return false,
+					"failed to apply flag '" .. entry.Flag .. "': " .. tostring(failure),
+					0,
+					skipped
+			end
+			local currentRead, currentValue = pcall(control.GetValue, control)
+			if not currentRead then
+				rollback(snapshot)
+				return false,
+					"failed to verify flag '" .. entry.Flag .. "': " .. tostring(currentValue),
+					0,
+					skipped
+			elseif not configValuesEqual(currentValue, entry.Value, 0) then
+				restore(snapshot)
+				skipped = skipped + 1
+			else
+				snapshot.Value = currentValue
+				appliedControls[#appliedControls + 1] = snapshot
+				applied = applied + 1
+			end
+		end
+	end
+	if silent ~= true then
+		for _, snapshot in ipairs(appliedControls) do
+			local control = snapshot.Control
+			if not control._destroyed then
+				local succeeded, failure = pcall(
+					control.SetValue,
+					control,
+					snapshot.Value,
+					false
+				)
+				if not succeeded then
+					return false,
+						"loaded values, but a callback pass failed: " .. tostring(failure),
+						applied,
+						skipped
+				end
+			end
+		end
+	end
+	return true, applied, skipped
+end
+
+local function listConfigs()
+	local folder, folderFailure = getConfigFolder()
+	if folder == nil then
+		return nil, folderFailure
+	end
+	local isFolder = getHostFunction("isfolder")
+	if isFolder then
+		local checked, exists = pcall(isFolder, folder)
+		if checked and not exists then
+			return {}
+		end
+	end
+	local listFiles = getHostFunction("listfiles")
+	if not listFiles then
+		return nil, "executor listfiles API is unavailable"
+	end
+	local listed, files = pcall(listFiles, folder)
+	if not listed or type(files) ~= "table" then
+		return nil, "failed to list configs: " .. tostring(files)
+	end
+	local configs = {}
+	local seen = {}
+	local isFile = getHostFunction("isfile")
+	for _, path in ipairs(files) do
+		if type(path) == "string" then
+			local normalizedPath = string.gsub(path, "\\", "/")
+			local fileName = string.match(normalizedPath, "([^/]+)$")
+			local parent = string.match(normalizedPath, "^(.*)/[^/]+$")
+			local directChild = parent == nil
+				or parent == folder
+				or string.sub(parent, -(#folder + 1)) == "/" .. folder
+			local isJson = fileName
+				and directChild
+				and string.lower(string.sub(fileName, -#CONFIG_EXTENSION)) == CONFIG_EXTENSION
+			local include = isJson
+			if include and isFile then
+				local checked, result = pcall(isFile, path)
+				include = checked and result == true
+			end
+			if include then
+				local name = string.sub(fileName, 1, #fileName - #CONFIG_EXTENSION)
+				local normalizedName = normalizeConfigName(name)
+				if normalizedName and not seen[normalizedName] then
+					seen[normalizedName] = true
+					configs[#configs + 1] = normalizedName
+				end
+			end
+		end
+	end
+	table.sort(configs)
+	return configs
+end
+
+local function deleteConfig(name)
+	local path, normalizedName = getConfigPath(name)
+	if not path then
+		return false, normalizedName
+	end
+	local isFile = getHostFunction("isfile")
+	if isFile then
+		local checked, exists = pcall(isFile, path)
+		if checked and not exists then
+			return false, "config '" .. normalizedName .. "' does not exist"
+		end
+	end
+	local deleteFile = getHostFunction("delfile")
+	if not deleteFile then
+		return false, "executor delfile API is unavailable"
+	end
+	local deleted, failure = pcall(deleteFile, path)
+	if not deleted or failure == false then
+		return false, "failed to delete config: " .. tostring(failure)
+	end
+	return true, normalizedName
+end
+
 function Window:GetValue(flag)
 	return self.Flags[flag]
 end
@@ -2011,6 +2827,34 @@ function Window:SetValue(flag, value, silent)
 	end
 	control:SetValue(value, silent)
 	return true
+end
+
+function Window:SaveConfig(name)
+	if self._destroyed then
+		return false, "window is destroyed"
+	end
+	return saveConfig(self._flagControls, name)
+end
+
+function Window:LoadConfig(name, silent)
+	if self._destroyed then
+		return false, "window is destroyed"
+	end
+	return loadConfig(self._flagControls, name, silent, self)
+end
+
+function Window:ListConfigs()
+	if self._destroyed then
+		return nil, "window is destroyed"
+	end
+	return listConfigs()
+end
+
+function Window:DeleteConfig(name)
+	if self._destroyed then
+		return false, "window is destroyed"
+	end
+	return deleteConfig(name)
 end
 
 function Window:_createBase()
@@ -2848,6 +3692,7 @@ function Control:_initialize(section, configuration, height)
 	self._hovered = false
 	self.Text = optionText(configuration)
 	self.Flag = configuration.Flag
+	self.Persistable = configuration.Persist ~= false
 	self.Callback = configuration.Callback
 end
 
@@ -2987,6 +3832,7 @@ function Button.new(section, configuration, callback)
 	configuration = normalizeConfiguration(configuration, callback)
 	local self = setmetatable({}, Button)
 	Control._initialize(self, section, configuration, configuration.Height or 37)
+	self.Persistable = false
 
 	self._outer, self._inner, self._highlight = createBox(self, 10)
 	self._text = createLabelDrawing(self, self.Text, 14)
@@ -3138,7 +3984,7 @@ function Checkbox:_layout(x, y, width)
 	self._window:_setTextPosition(
 		self._label,
 		self.Text,
-		Vector2.new(x + 21, centeredTextY(y + 5, 14, self._window.Theme.TextSize))
+		Vector2.new(x + 21, centeredTextY(y + 4, 14, self._window.Theme.TextSize))
 	)
 	setRegionRectangle(self._region, x, y + 3, math.min(width, 21 + textLength(self.Text) * 7), 16)
 
@@ -3214,6 +4060,7 @@ local function initializeKeybind(target, parent, configuration, normalized)
 	target.Callback = configuration.Callback
 	target.Changed = configuration.Changed
 	target.Flag = configuration.Flag
+	target.Persistable = configuration.Persist ~= false
 	target.State = false
 
 	local theme = target._window.Theme
@@ -3378,18 +4225,20 @@ function KeybindAddon:_inputBegan()
 	end
 end
 
-function KeybindAddon:_inputEnded()
+function KeybindAddon:_inputEnded(silent)
 	if self.Mode == "Hold" and self.State then
 		self.State = false
 		if self._checkbox then
-			self._checkbox:SetValue(false)
+			self._checkbox:SetValue(false, silent)
 		end
-		safeCall(self.Callback, false, self)
+		if not silent then
+			safeCall(self.Callback, false, self)
+		end
 	end
 end
 
 function KeybindAddon:SetValue(value, silent)
-	local changed = self._library:_setKeybindToken(self, value)
+	local changed = self._library:_setKeybindToken(self, value, silent)
 	if self._destroyed then
 		return self
 	end
@@ -3490,6 +4339,7 @@ local function initializeColorPicker(target, parent, configuration, normalized)
 	target.Value = configuration.Default or configuration.Value or target._window.Theme.Accent
 	target.Callback = configuration.Callback
 	target.Flag = configuration.Flag
+	target.Persistable = configuration.Persist ~= false
 	target.Rainbow = configuration.Rainbow == true
 	target.RainbowSpeed = tonumber(configuration.RainbowSpeed) or 0.12
 	target.Hue, target.Saturation, target.Brightness = target.Value:ToHSV()
@@ -3953,7 +4803,6 @@ end
 
 function ColorPickerAddon:_layout(x, y)
 	local window = self._window
-	local theme = window.Theme
 	self._x = x
 	self._y = y
 	window:_setPositionSize(self._swatchOuter, Vector2.new(x, y + 7), Vector2.new(18, 8))
@@ -4680,7 +5529,7 @@ local function initializeDropdown(self, section, configuration, isMultiple)
 		table.insert(self._regions, self._popupRegion)
 
 		for rowIndex = 1, self.MaxVisible do
-			local row = {}
+			local row: any = {}
 			row._background = popupDraw("Square", {
 				Filled = true,
 				Color = theme.Control,
@@ -5709,7 +6558,7 @@ function Listbox.new(section, configuration)
 	self._inner = newRoundedRectangle(self._window, self._drawings, theme.Input, 12, 1)
 
 	for rowIndex = 1, self.VisibleRows do
-		local row = {}
+		local row: any = {}
 		row._background = self:_draw("Square", {
 			Filled = true,
 			Color = theme.Input,
@@ -5882,6 +6731,7 @@ function Label.new(section, configuration)
 	configuration = normalizeConfiguration(configuration)
 	local self = setmetatable({}, Label)
 	Control._initialize(self, section, configuration, configuration.Height or 23)
+	self.Persistable = false
 	self.Value = self.Text
 	self._text = createLabelDrawing(self, self.Text, 14)
 	self._window:_set(self._text, {
@@ -5919,6 +6769,7 @@ function Separator.new(section, configuration)
 	configuration = normalizeConfiguration(configuration)
 	local self = setmetatable({}, Separator)
 	Control._initialize(self, section, configuration, configuration.Height or 16)
+	self.Persistable = false
 	self._line = self:_draw("Line", {
 		From = self._window.Position,
 		To = self._window.Position,
@@ -6140,6 +6991,34 @@ function Section:AddColorPicker(configuration)
 end
 
 Section.ColorPicker = Section.AddColorPicker
+
+function Nephren:SetConfigFolder(folder)
+	local previousFolder = self.ConfigFolder
+	self.ConfigFolder = folder
+	local normalizedFolder, failure = getConfigFolder()
+	if normalizedFolder == nil then
+		self.ConfigFolder = previousFolder
+		return false, failure
+	end
+	self.ConfigFolder = normalizedFolder
+	return true, normalizedFolder
+end
+
+function Nephren:SaveConfig(name)
+	return saveConfig(self._flagOwners, name)
+end
+
+function Nephren:LoadConfig(name, silent)
+	return loadConfig(self._flagOwners, name, silent)
+end
+
+function Nephren:ListConfigs()
+	return listConfigs()
+end
+
+function Nephren:DeleteConfig(name)
+	return deleteConfig(name)
+end
 
 function Nephren:CreateWindow(configuration)
 	assert(not self._unloading, "Nephren cannot create a window while unloading")

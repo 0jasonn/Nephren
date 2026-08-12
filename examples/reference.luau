@@ -1,5 +1,6 @@
 -- Adapt this line to however your development tool loads local Luau modules.
-local Nephren = loadstring(readfile("src/Nephren.lua"))()
+local executor: any = _G
+local Nephren = executor.loadstring(executor.readfile("src/Nephren.luau"))()
 
 local window = Nephren:CreateWindow({
     Title = "Title",
@@ -110,5 +111,9 @@ right:AddListbox({
 })
 
 -- Later:
+-- local saved, countOrError = window:SaveConfig("default")
+-- assert(saved, countOrError)
+-- local loaded, appliedOrError = window:LoadConfig("default")
+-- assert(loaded, appliedOrError)
 -- window:Destroy()
 -- Nephren:Unload()
