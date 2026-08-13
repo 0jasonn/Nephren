@@ -53,6 +53,11 @@ local DEFAULT_AIM_SMOOTHNESS = 1
 local MAX_AIM_SMOOTHNESS = 1
 local AIM_LOCKED_RESPONSE = 0.12
 local AIM_LOCKED_MAX_STEP = 10
+local DEFAULT_AIM_FOV_RADIUS = 150
+local MIN_AIM_FOV_RADIUS = 25
+local MAX_AIM_FOV_RADIUS = 500
+local AIM_FOV_CIRCLE_COLOR = Color3.fromRGB(255, 255, 255)
+local AIM_FOV_CIRCLE_SIDES = 64
 local ESP_BOX_COLOR = Color3.fromRGB(255, 255, 255)
 local ESP_OUTLINE_COLOR = Color3.fromRGB(0, 0, 0)
 local ESP_NEAR_PLANE = 0.05
@@ -148,11 +153,20 @@ local aimConnection
 local aimAssistMasterEnabled = false
 local aimAssistActivationMode = "On Bind Press"
 local aimAssistBindHeld = false
+local aimStickyEnabled = false
+local aimAliveCheckEnabled = true
 local aimTeamCheckEnabled = false
 local aimVisibilityCheckEnabled = false
+local aimFovEnabled = false
+local aimFovRadius = DEFAULT_AIM_FOV_RADIUS
+local aimFovRadiusSquared = aimFovRadius * aimFovRadius
+local aimFovCircleEnabled = false
+local aimFovCircleColor = AIM_FOV_CIRCLE_COLOR
 local aimSmoothness = DEFAULT_AIM_SMOOTHNESS
 local aimMoveResidualX = 0
 local aimMoveResidualY = 0
+local aimLockedTarget
+local aimFovCircle
 local aimRaycastParameters = RaycastParams.new()
 local aimAssistToggle
 local espEnabled = false
@@ -167,6 +181,7 @@ local espRenderDistance = DEFAULT_ESP_RENDER_DISTANCE
 local espRenderDistanceSquared = espRenderDistance * espRenderDistance
 local espRecords = {}
 local gameWindowFocused = type(isrbxactive) ~= "function" or isrbxactive()
+local cleanupWeaponScreen = function() end
 local window
 
 aimRaycastParameters.FilterType = Enum.RaycastFilterType.Exclude
@@ -296,6 +311,7 @@ local function disableAimAssist()
     local connection = aimConnection
     aimMoveResidualX = 0
     aimMoveResidualY = 0
+    aimLockedTarget = nil
 
     if not connection then
         return
@@ -430,7 +446,8 @@ local function playersAreTeammates(otherPlayer)
 end
 
 local function canTargetPlayer(otherPlayer)
-    return otherPlayer ~= player
+    return otherPlayer.Parent == Players
+        and otherPlayer ~= player
         and (not aimTeamCheckEnabled or not playersAreTeammates(otherPlayer))
 end
 
@@ -460,36 +477,99 @@ local function targetIsVisible(camera, targetCharacter, targetPart)
     return workspace:Raycast(origin, direction, aimRaycastParameters) == nil
 end
 
-local function getNearestPlayerHeadPosition(camera, aimOrigin)
+local function getPlayerHeadScreenPosition(camera, otherPlayer)
+    if not canTargetPlayer(otherPlayer) then
+        return nil
+    end
+
+    local otherCharacter = otherPlayer.Character
+    local humanoid = otherCharacter
+        and otherCharacter:FindFirstChildOfClass("Humanoid")
+    local root = otherCharacter
+        and otherCharacter:FindFirstChild("HumanoidRootPart")
+    local head = otherCharacter and otherCharacter:FindFirstChild("Head")
+
+    if not humanoid
+        or (aimAliveCheckEnabled and humanoid.Health <= 0)
+        or not root
+        or not head
+    then
+        return nil
+    end
+
+    local viewportPosition, onScreen = camera:WorldToViewportPoint(head.Position)
+
+    if not onScreen or viewportPosition.Z <= 0 then
+        return nil
+    end
+
+    return Vector2.new(viewportPosition.X, viewportPosition.Y), otherCharacter, head
+end
+
+local function targetIsWithinAimFov(targetPosition, aimOrigin)
+    if not aimFovEnabled then
+        return true
+    end
+
+    local deltaX = targetPosition.X - aimOrigin.X
+    local deltaY = targetPosition.Y - aimOrigin.Y
+
+    return deltaX * deltaX + deltaY * deltaY <= aimFovRadiusSquared
+end
+
+local function getNearestAimTarget(camera, aimOrigin)
+    local nearestPlayer
     local nearestPosition
     local nearestDistanceSquared = math.huge
 
     for _, otherPlayer in ipairs(Players:GetPlayers()) do
-        if canTargetPlayer(otherPlayer) then
-            local otherCharacter = otherPlayer.Character
-            local humanoid = otherCharacter
-                and otherCharacter:FindFirstChildOfClass("Humanoid")
-            local root = otherCharacter
-                and otherCharacter:FindFirstChild("HumanoidRootPart")
-            local head = otherCharacter and otherCharacter:FindFirstChild("Head")
+        local targetPosition, targetCharacter, targetHead = getPlayerHeadScreenPosition(
+            camera,
+            otherPlayer
+        )
 
-            if humanoid and humanoid.Health > 0 and root and head then
-                local viewportPosition, onScreen = camera:WorldToViewportPoint(head.Position)
+        if targetPosition then
+            local deltaX = targetPosition.X - aimOrigin.X
+            local deltaY = targetPosition.Y - aimOrigin.Y
+            local distanceSquared = deltaX * deltaX + deltaY * deltaY
 
-                if onScreen and viewportPosition.Z > 0 then
-                    local deltaX = viewportPosition.X - aimOrigin.X
-                    local deltaY = viewportPosition.Y - aimOrigin.Y
-                    local distanceSquared = deltaX * deltaX + deltaY * deltaY
-
-                    if distanceSquared < nearestDistanceSquared
-                        and targetIsVisible(camera, otherCharacter, head)
-                    then
-                        nearestDistanceSquared = distanceSquared
-                        nearestPosition = Vector2.new(viewportPosition.X, viewportPosition.Y)
-                    end
-                end
+            if targetIsWithinAimFov(targetPosition, aimOrigin)
+                and distanceSquared < nearestDistanceSquared
+                and targetIsVisible(camera, targetCharacter, targetHead)
+            then
+                nearestDistanceSquared = distanceSquared
+                nearestPlayer = otherPlayer
+                nearestPosition = targetPosition
             end
         end
+    end
+
+    return nearestPlayer, nearestPosition
+end
+
+local function getAimTargetPosition(camera, aimOrigin)
+    if aimStickyEnabled and aimLockedTarget then
+        local targetPosition, targetCharacter, targetHead = getPlayerHeadScreenPosition(
+            camera,
+            aimLockedTarget
+        )
+
+        if targetPosition
+            and targetIsWithinAimFov(targetPosition, aimOrigin)
+            and targetIsVisible(camera, targetCharacter, targetHead)
+        then
+            return targetPosition
+        end
+
+        aimLockedTarget = nil
+    end
+
+    local nearestPlayer, nearestPosition = getNearestAimTarget(camera, aimOrigin)
+
+    if aimStickyEnabled then
+        aimLockedTarget = nearestPlayer
+    else
+        aimLockedTarget = nil
     end
 
     return nearestPosition
@@ -506,6 +586,30 @@ local function getAimOrigin(camera)
         or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
 
     return UserInputService:GetMouseLocation(), mouseLocked
+end
+
+local function updateAimFovCircle()
+    local circle = aimFovCircle
+    local camera = workspace.CurrentCamera
+    local shouldShow = circle
+        and aimFovCircleEnabled
+        and gameWindowFocused
+        and camera
+        and window
+        and not window.Visible
+
+    if not shouldShow then
+        if circle then
+            circle.Visible = false
+        end
+
+        return
+    end
+
+    circle.Color = aimFovCircleColor
+    circle.Position = getAimOrigin(camera)
+    circle.Radius = aimFovRadius
+    circle.Visible = true
 end
 
 local function moveMouseToward(targetPosition, aimOrigin, mouseLocked)
@@ -554,6 +658,20 @@ local function enableAimAssist()
         if not gameWindowFocused or (window and window.Visible) then
             aimMoveResidualX = 0
             aimMoveResidualY = 0
+            aimLockedTarget = nil
+            return
+        end
+
+        local localCharacter = player.Character
+        local localHumanoid = localCharacter
+            and localCharacter:FindFirstChildOfClass("Humanoid")
+
+        if aimAliveCheckEnabled
+            and (not localHumanoid or localHumanoid.Health <= 0)
+        then
+            aimMoveResidualX = 0
+            aimMoveResidualY = 0
+            aimLockedTarget = nil
             return
         end
 
@@ -562,11 +680,12 @@ local function enableAimAssist()
         if not camera then
             aimMoveResidualX = 0
             aimMoveResidualY = 0
+            aimLockedTarget = nil
             return
         end
 
         local aimOrigin, mouseLocked = getAimOrigin(camera)
-        local targetPosition = getNearestPlayerHeadPosition(camera, aimOrigin)
+        local targetPosition = getAimTargetPosition(camera, aimOrigin)
 
         if not targetPosition then
             aimMoveResidualX = 0
@@ -612,7 +731,7 @@ local function refreshAimAssist()
     warn("Failed to enable aim assist: " .. tostring(failure))
 end
 
-local function removeEspDrawing(drawing)
+local function removeDrawing(drawing)
     if not drawing then
         return
     end
@@ -623,6 +742,44 @@ local function removeEspDrawing(drawing)
     pcall(function()
         drawing:Remove()
     end)
+end
+
+local function destroyAimFovCircle()
+    aimFovCircleEnabled = false
+    local circle = aimFovCircle
+    aimFovCircle = nil
+    removeDrawing(circle)
+end
+
+local function initializeAimFovCircle()
+    local circle = Drawing.new("Circle")
+    local connection
+    aimFovCircle = circle
+
+    local succeeded, failure = pcall(function()
+        circle.Color = aimFovCircleColor
+        circle.Filled = false
+        circle.NumSides = AIM_FOV_CIRCLE_SIDES
+        circle.Position = Vector2.new(0, 0)
+        circle.Radius = aimFovRadius
+        circle.Thickness = 1
+        circle.Transparency = 1
+        circle.Visible = false
+        circle.ZIndex = 1
+        connection = RunService.RenderStepped:Connect(updateAimFovCircle)
+        table.insert(mainConnections, connection)
+    end)
+
+    if succeeded then
+        return
+    end
+
+    if connection then
+        connection:Disconnect()
+    end
+
+    destroyAimFovCircle()
+    error(failure, 0)
 end
 
 local function hideEspRecord(record)
@@ -645,7 +802,7 @@ local function destroyEspRecord(otherPlayer)
 
     espRecords[otherPlayer] = nil
     for _, drawing in ipairs(record.drawings) do
-        removeEspDrawing(drawing)
+        removeDrawing(drawing)
     end
 end
 
@@ -817,7 +974,7 @@ local function createEspRecord(otherPlayer)
 
     if not succeeded then
         for _, drawing in ipairs(record.drawings) do
-            removeEspDrawing(drawing)
+            removeDrawing(drawing)
         end
 
         warn("Failed to create ESP box: " .. tostring(failure))
@@ -1310,11 +1467,17 @@ local function destroyAllEspRecords()
 
     for _, record in pairs(espRecords) do
         for _, drawing in ipairs(record.drawings) do
-            removeEspDrawing(drawing)
+            removeDrawing(drawing)
         end
     end
 
     table.clear(espRecords)
+end
+
+local function cleanupMain()
+    destroyAllEspRecords()
+    destroyAimFovCircle()
+    cleanupWeaponScreen()
 end
 
 local function refreshEspStyles()
@@ -1384,6 +1547,10 @@ table.insert(mainConnections, UserInputService.WindowFocused:Connect(function()
 end))
 table.insert(mainConnections, UserInputService.WindowFocusReleased:Connect(function()
     gameWindowFocused = false
+
+    if aimFovCircle then
+        aimFovCircle.Visible = false
+    end
 end))
 
 local function enableInfiniteAmmo()
@@ -1961,6 +2128,12 @@ disableInfiniteGrenades()
 
 local playerGui = player:WaitForChild("PlayerGui")
 local hiddenUiInstances = {}
+local hiddenWeaponFrames = {}
+local boundWeaponContainers = setmetatable({}, { __mode = "k" })
+local boundWeaponHumanoids = setmetatable({}, { __mode = "k" })
+local hideWeaponScreenEnabled = true
+local weaponScreenActive = true
+local weaponScreenReconcilePending = false
 
 local function hasPrimaryWeapon()
     local character = player.Character
@@ -1977,15 +2150,6 @@ local function hasPrimaryWeapon()
     return false
 end
 
-local currentCharacter = player.Character
-local currentHumanoid = currentCharacter
-    and currentCharacter:FindFirstChildOfClass("Humanoid")
-local weaponChooserAllowed = not currentCharacter
-    or not currentHumanoid
-    or currentHumanoid.Health <= 0
-    or not hasPrimaryWeapon()
-local weaponChooserWasVisible = false
-
 local function grenadeRefreshIsRecent()
     local state = globals.__InfiniteGrenades
 
@@ -1995,11 +2159,87 @@ local function grenadeRefreshIsRecent()
         and os.clock() - state.refreshRequestAt < 2
 end
 
+local function getWeaponFrame()
+    local staticScreenGui = playerGui:FindFirstChild("StaticScreenGui")
+
+    return staticScreenGui and staticScreenGui:FindFirstChild("WeaponFrame")
+end
+
+local function weaponScreenShouldBeHidden()
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if not character or (humanoid and humanoid.Health <= 0) then
+        return false
+    end
+
+    if grenadeRefreshIsRecent() then
+        return true
+    end
+
+    return humanoid ~= nil and humanoid.Health > 0 and hasPrimaryWeapon()
+end
+
+local function restoreManagedWeaponFrame(weaponFrame)
+    if not hiddenWeaponFrames[weaponFrame] then
+        return
+    end
+
+    hiddenWeaponFrames[weaponFrame] = nil
+
+    if weaponFrame.Parent and weaponFrame:IsDescendantOf(playerGui) then
+        pcall(function()
+            weaponFrame.Visible = true
+        end)
+    end
+end
+
+local function restoreManagedWeaponFrames()
+    local weaponFrames = {}
+
+    for weaponFrame in pairs(hiddenWeaponFrames) do
+        table.insert(weaponFrames, weaponFrame)
+    end
+
+    for _, weaponFrame in ipairs(weaponFrames) do
+        restoreManagedWeaponFrame(weaponFrame)
+    end
+end
+
+local function hideManagedWeaponFrame(weaponFrame)
+    if not weaponFrame.Visible then
+        return
+    end
+
+    hiddenWeaponFrames[weaponFrame] = true
+    weaponFrame.Visible = false
+end
+
 local function shouldHideGameUi(instance)
     local mode = HIDDEN_GAME_UI[instance.Name]
 
     return mode == "Always"
-        or (mode == "DuringGameplay" and not weaponChooserAllowed)
+        or (
+            mode == "DuringGameplay"
+            and hideWeaponScreenEnabled
+            and weaponScreenShouldBeHidden()
+        )
+end
+
+local function syncGameUiVisibility(instance)
+    if not instance.Visible then
+        return
+    end
+
+    if shouldHideGameUi(instance) then
+        if instance.Name == "WeaponFrame" then
+            hideManagedWeaponFrame(instance)
+        else
+            instance.Visible = false
+        end
+    elseif instance.Name == "WeaponFrame" then
+        hiddenWeaponFrames[instance] = nil
+    end
 end
 
 local function hideGameUi(instance)
@@ -2018,25 +2258,12 @@ local function hideGameUi(instance)
         table.insert(
             mainConnections,
             instance:GetPropertyChangedSignal("Visible"):Connect(function()
-                if instance.Visible and shouldHideGameUi(instance) then
-                    instance.Visible = false
-                elseif instance.Name == "WeaponFrame" then
-                    if instance.Visible then
-                        weaponChooserWasVisible = true
-                    elseif weaponChooserWasVisible then
-                        weaponChooserWasVisible = false
-                        weaponChooserAllowed = false
-                    end
-                end
+                syncGameUiVisibility(instance)
             end)
         )
     end
 
-    if shouldHideGameUi(instance) then
-        instance.Visible = false
-    elseif instance.Name == "WeaponFrame" and instance.Visible then
-        weaponChooserWasVisible = true
-    end
+    syncGameUiVisibility(instance)
 end
 
 local function hideStaticGameUi(screenGui)
@@ -2062,72 +2289,114 @@ table.insert(mainConnections, playerGui.DescendantAdded:Connect(function(instanc
     end
 end))
 
-local function bindWeaponChooserToCharacter(character)
-    local function bindHumanoid(humanoid)
-        table.insert(mainConnections, humanoid.Died:Connect(function()
-            weaponChooserAllowed = true
-            weaponChooserWasVisible = false
-        end))
+local function reconcileWeaponScreen()
+    if not weaponScreenActive then
+        return
     end
+
+    local weaponFrame = getWeaponFrame()
+
+    if not weaponFrame then
+        return
+    end
+
+    if not hideWeaponScreenEnabled or not weaponScreenShouldBeHidden() then
+        restoreManagedWeaponFrame(weaponFrame)
+        return
+    end
+
+    hideManagedWeaponFrame(weaponFrame)
+end
+
+local function scheduleWeaponScreenReconcile()
+    if not weaponScreenActive or weaponScreenReconcilePending then
+        return
+    end
+
+    weaponScreenReconcilePending = true
+    task.defer(function()
+        weaponScreenReconcilePending = false
+
+        if weaponScreenActive then
+            reconcileWeaponScreen()
+        end
+    end)
+end
+
+local function watchWeaponContainer(container)
+    if boundWeaponContainers[container] then
+        return
+    end
+
+    boundWeaponContainers[container] = true
+    local function onChildChanged(child)
+        if PRIMARY_WEAPON_NAMES[child.Name] then
+            scheduleWeaponScreenReconcile()
+        end
+    end
+
+    table.insert(mainConnections, container.ChildAdded:Connect(onChildChanged))
+    table.insert(mainConnections, container.ChildRemoved:Connect(onChildChanged))
+end
+
+local function bindWeaponScreenHumanoid(humanoid)
+    if boundWeaponHumanoids[humanoid] then
+        return
+    end
+
+    boundWeaponHumanoids[humanoid] = true
+    table.insert(mainConnections, humanoid.Died:Connect(scheduleWeaponScreenReconcile))
+end
+
+local function bindWeaponScreenCharacter(character)
+    watchWeaponContainer(character)
 
     local humanoid = character:FindFirstChildOfClass("Humanoid")
 
     if humanoid then
-        bindHumanoid(humanoid)
-        return
+        bindWeaponScreenHumanoid(humanoid)
     end
 
-    local childAddedConnection
-    childAddedConnection = character.ChildAdded:Connect(function(child)
+    table.insert(mainConnections, character.ChildAdded:Connect(function(child)
         if child:IsA("Humanoid") then
-            childAddedConnection:Disconnect()
-            bindHumanoid(child)
+            bindWeaponScreenHumanoid(child)
+            scheduleWeaponScreenReconcile()
         end
-    end)
-    table.insert(mainConnections, childAddedConnection)
+    end))
 end
 
-local function showWeaponChooserIfAllowed()
-    if not weaponChooserAllowed then
-        return
-    end
+local function bindWeaponScreenBackpack(backpack)
+    watchWeaponContainer(backpack)
+    scheduleWeaponScreenReconcile()
+end
 
-    local staticScreenGui = playerGui:FindFirstChild("StaticScreenGui")
-    local weaponFrame = staticScreenGui
-        and staticScreenGui:FindFirstChild("WeaponFrame")
+local function setHideWeaponScreenEnabled(enabled)
+    hideWeaponScreenEnabled = enabled
 
-    if weaponFrame then
-        weaponFrame.Visible = true
+    if enabled then
+        reconcileWeaponScreen()
+    else
+        restoreManagedWeaponFrames()
     end
 end
 
-local function scheduleWeaponChooserFallback(character)
-    task.delay(0.5, function()
-        local activeMain = globals.__NephrenMain
-
-        if not activeMain
-            or activeMain.session ~= mainSession
-            or player.Character ~= character
-            or hasPrimaryWeapon()
-        then
-            return
-        end
-
-        weaponChooserAllowed = true
-        weaponChooserWasVisible = false
-        showWeaponChooserIfAllowed()
-    end)
+cleanupWeaponScreen = function()
+    weaponScreenActive = false
+    hideWeaponScreenEnabled = false
+    restoreManagedWeaponFrames()
+    table.clear(boundWeaponContainers)
+    table.clear(boundWeaponHumanoids)
 end
 
 table.insert(mainConnections, player.CharacterAdded:Connect(function(character)
-    if not grenadeRefreshIsRecent() then
-        weaponChooserAllowed = true
-        weaponChooserWasVisible = false
-    end
+    bindWeaponScreenCharacter(character)
+    scheduleWeaponScreenReconcile()
 
-    bindWeaponChooserToCharacter(character)
-    showWeaponChooserIfAllowed()
-    scheduleWeaponChooserFallback(character)
+    task.delay(2.1, function()
+        if weaponScreenActive and player.Character == character then
+            scheduleWeaponScreenReconcile()
+        end
+    end)
 end))
 table.insert(mainConnections, player.CharacterRemoving:Connect(function(character)
     local humanoid = character:FindFirstChildOfClass("Humanoid")
@@ -2136,17 +2405,28 @@ table.insert(mainConnections, player.CharacterRemoving:Connect(function(characte
         or not humanoid
         or humanoid.Health <= 0
     then
-        weaponChooserAllowed = true
-        weaponChooserWasVisible = false
+        restoreManagedWeaponFrames()
+    end
+
+    scheduleWeaponScreenReconcile()
+end))
+table.insert(mainConnections, player.ChildAdded:Connect(function(child)
+    if child:IsA("Backpack") then
+        bindWeaponScreenBackpack(child)
     end
 end))
 
 if player.Character then
-    bindWeaponChooserToCharacter(player.Character)
-    scheduleWeaponChooserFallback(player.Character)
+    bindWeaponScreenCharacter(player.Character)
 end
 
-showWeaponChooserIfAllowed()
+local currentBackpack = player:FindFirstChildOfClass("Backpack")
+
+if currentBackpack then
+    bindWeaponScreenBackpack(currentBackpack)
+end
+
+reconcileWeaponScreen()
 
 window = Nephren:CreateWindow({
     Title = "Nephren",
@@ -2157,6 +2437,7 @@ window = Nephren:CreateWindow({
 local weaponTab = window:AddTab("Weapon")
 local aimbotTab = window:AddTab("Aimbot")
 local espTab = window:AddTab("ESP")
+local miscTab = window:AddTab("Misc")
 local configTab = window:AddTab("Config")
 local weaponSection = weaponTab:AddSection({
     Title = "Weapon",
@@ -2167,6 +2448,10 @@ local aimbotSection = aimbotTab:AddSection({
     Title = "Aimbot",
     Side = "Left",
 })
+local aimbotTargetingSection = aimbotTab:AddSection({
+    Title = "Targeting",
+    Side = "Right",
+})
 local espSection = espTab:AddSection({
     Title = "Player ESP",
     Side = "Left",
@@ -2174,6 +2459,10 @@ local espSection = espTab:AddSection({
 local espDetailsSection = espTab:AddSection({
     Title = "Player Info",
     Side = "Right",
+})
+local miscSection = miscTab:AddSection({
+    Title = "Game UI",
+    Side = "Left",
 })
 local configSelectionSection = configTab:AddSection({
     Title = "Configs",
@@ -2224,6 +2513,15 @@ weaponSection:AddToggle({
     end,
 })
 
+miscSection:AddToggle({
+    Text = "Hide Weapon Selection",
+    Default = hideWeaponScreenEnabled,
+    Flag = "HideWeaponSelection",
+    Callback = function(enabled)
+        setHideWeaponScreenEnabled(enabled)
+    end,
+})
+
 aimAssistToggle = aimbotSection:AddToggle({
     Text = "Enabled",
     Default = false,
@@ -2234,7 +2532,26 @@ aimAssistToggle = aimbotSection:AddToggle({
     end,
 })
 
-aimbotSection:AddToggle({
+aimbotTargetingSection:AddToggle({
+    Text = "Sticky Aim",
+    Default = aimStickyEnabled,
+    Flag = "AimAssistStickyAim",
+    Callback = function(enabled)
+        aimStickyEnabled = enabled
+        aimLockedTarget = nil
+    end,
+})
+
+aimbotTargetingSection:AddToggle({
+    Text = "Alive Check",
+    Default = aimAliveCheckEnabled,
+    Flag = "AimAssistAliveCheck",
+    Callback = function(enabled)
+        aimAliveCheckEnabled = enabled
+    end,
+})
+
+aimbotTargetingSection:AddToggle({
     Text = "Team Check",
     Default = aimTeamCheckEnabled,
     Flag = "AimAssistTeamCheck",
@@ -2243,12 +2560,66 @@ aimbotSection:AddToggle({
     end,
 })
 
-aimbotSection:AddToggle({
+aimbotTargetingSection:AddToggle({
     Text = "Visibility Check",
     Default = aimVisibilityCheckEnabled,
     Flag = "AimAssistVisibilityCheck",
     Callback = function(enabled)
         aimVisibilityCheckEnabled = enabled
+    end,
+})
+
+aimbotTargetingSection:AddToggle({
+    Text = "FOV Limit",
+    Default = aimFovEnabled,
+    Flag = "AimAssistFOVEnabled",
+    Callback = function(enabled)
+        aimFovEnabled = enabled
+        aimLockedTarget = nil
+    end,
+})
+
+aimbotTargetingSection:AddSlider({
+    Text = "FOV Radius",
+    Min = MIN_AIM_FOV_RADIUS,
+    Max = MAX_AIM_FOV_RADIUS,
+    Step = 5,
+    Default = aimFovRadius,
+    Suffix = " px",
+    Flag = "AimAssistFOVRadius",
+    Callback = function(value)
+        aimFovRadius = value
+        aimFovRadiusSquared = value * value
+        aimLockedTarget = nil
+
+        if aimFovCircle then
+            aimFovCircle.Radius = value
+        end
+    end,
+})
+
+local aimFovCircleToggle = aimbotTargetingSection:AddToggle({
+    Text = "FOV Circle",
+    Default = aimFovCircleEnabled,
+    Flag = "AimAssistFOVCircle",
+    Callback = function(enabled)
+        aimFovCircleEnabled = enabled
+
+        if aimFovCircle and not enabled then
+            aimFovCircle.Visible = false
+        end
+    end,
+})
+
+aimFovCircleToggle:AddColorPicker({
+    Default = aimFovCircleColor,
+    Flag = "AimAssistFOVCircleColor",
+    Callback = function(color)
+        aimFovCircleColor = color
+
+        if aimFovCircle then
+            aimFovCircle.Color = color
+        end
     end,
 })
 
@@ -2637,5 +3008,11 @@ globals.__NephrenMain = {
     window = window,
     connections = mainConnections,
     session = mainSession,
-    cleanup = destroyAllEspRecords,
+    cleanup = cleanupMain,
 }
+
+local fovCircleInitialized, fovCircleFailure = pcall(initializeAimFovCircle)
+
+if not fovCircleInitialized then
+    warn("Failed to initialize FOV circle: " .. tostring(fovCircleFailure))
+end
