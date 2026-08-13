@@ -56,6 +56,21 @@ local AIM_LOCKED_MAX_STEP = 10
 local ESP_BOX_COLOR = Color3.fromRGB(255, 255, 255)
 local ESP_OUTLINE_COLOR = Color3.fromRGB(0, 0, 0)
 local ESP_NEAR_PLANE = 0.05
+local ESP_CORNER_SCALE = 0.25
+local ESP_FILL_DARKEN_FACTOR = 0.2
+local ESP_FILL_SEGMENT_COUNT = 12
+local ESP_TEXT_SIZE = 13
+local ESP_TEXT_OFFSET = 2
+local ESP_TEXT_WIDTH_FACTOR = 0.6
+local DEFAULT_ESP_FILL_TRANSPARENCY = 75
+local DEFAULT_ESP_RENDER_DISTANCE = 2000
+local MIN_ESP_RENDER_DISTANCE = 100
+local MAX_ESP_RENDER_DISTANCE = 5000
+local ESP_BOX_STYLES = {
+    "Box",
+    "Corner",
+    "3D",
+}
 local ESP_BOUNDING_CORNERS = {
     Vector3.new(-1, -1, -1),
     Vector3.new(-1, -1, 1),
@@ -65,6 +80,20 @@ local ESP_BOUNDING_CORNERS = {
     Vector3.new(1, -1, 1),
     Vector3.new(1, 1, -1),
     Vector3.new(1, 1, 1),
+}
+local ESP_3D_EDGES = {
+    { 1, 2 },
+    { 1, 3 },
+    { 1, 5 },
+    { 2, 4 },
+    { 2, 6 },
+    { 3, 4 },
+    { 3, 7 },
+    { 4, 8 },
+    { 5, 6 },
+    { 5, 7 },
+    { 6, 8 },
+    { 7, 8 },
 }
 local INFINITE_GRENADES_RENDER_NAME = "__InfiniteGrenadesPreserveView"
 local AMMO_WEAPON_NAMES = {
@@ -128,6 +157,14 @@ local aimRaycastParameters = RaycastParams.new()
 local aimAssistToggle
 local espEnabled = false
 local espTeamCheckEnabled = false
+local espBoxStyle = "Box"
+local espBoxColor = ESP_BOX_COLOR
+local espFillEnabled = false
+local espFillTransparency = DEFAULT_ESP_FILL_TRANSPARENCY
+local espNamesEnabled = false
+local espDistanceEnabled = false
+local espRenderDistance = DEFAULT_ESP_RENDER_DISTANCE
+local espRenderDistanceSquared = espRenderDistance * espRenderDistance
 local espRecords = {}
 local gameWindowFocused = type(isrbxactive) ~= "function" or isrbxactive()
 local window
@@ -589,12 +626,14 @@ local function removeEspDrawing(drawing)
 end
 
 local function hideEspRecord(record)
-    pcall(function()
-        record.outline.Visible = false
-    end)
-    pcall(function()
-        record.box.Visible = false
-    end)
+    for drawing in pairs(record.visibleDrawings) do
+        pcall(function()
+            drawing.Visible = false
+        end)
+    end
+
+    table.clear(record.visibleDrawings)
+    table.clear(record.pendingVisibleDrawings)
 end
 
 local function destroyEspRecord(otherPlayer)
@@ -605,8 +644,144 @@ local function destroyEspRecord(otherPlayer)
     end
 
     espRecords[otherPlayer] = nil
-    removeEspDrawing(record.box)
-    removeEspDrawing(record.outline)
+    for _, drawing in ipairs(record.drawings) do
+        removeEspDrawing(drawing)
+    end
+end
+
+local function newEspDrawing(record, kind, zIndex)
+    local drawing = Drawing.new(kind)
+    table.insert(record.drawings, drawing)
+    drawing.Visible = false
+    drawing.Transparency = 1
+    drawing.ZIndex = zIndex
+
+    return drawing
+end
+
+local function getEspGradientColor(index, segmentCount)
+    local ratio = segmentCount > 1 and (index - 1) / (segmentCount - 1) or 0
+    local scale = 1 - ratio * (1 - ESP_FILL_DARKEN_FACTOR)
+
+    return Color3.new(
+        espBoxColor.R * scale,
+        espBoxColor.G * scale,
+        espBoxColor.B * scale
+    )
+end
+
+local function getEspFillOpacity()
+    return math.clamp(1 - espFillTransparency / 100, 0, 1)
+end
+
+local function styleEspFillSegments(record)
+    local segmentCount = record.fillActiveSegmentCount or ESP_FILL_SEGMENT_COUNT
+    local fillOpacity = getEspFillOpacity()
+
+    for index = 1, math.min(segmentCount, #record.fillSegments) do
+        local segment = record.fillSegments[index]
+        segment.Color = getEspGradientColor(index, segmentCount)
+        segment.Transparency = fillOpacity
+    end
+end
+
+local function styleEspText(text)
+    if not text then
+        return
+    end
+
+    text.Color = espBoxColor
+    text.OutlineColor = ESP_OUTLINE_COLOR
+    text.Transparency = 1
+end
+
+local function styleEspRecord(record)
+    record.outline.Color = ESP_OUTLINE_COLOR
+    record.outline.Transparency = 1
+    record.box.Color = espBoxColor
+    record.box.Transparency = 1
+
+    for _, outline in ipairs(record.lineOutlines) do
+        outline.Color = ESP_OUTLINE_COLOR
+        outline.Transparency = 1
+    end
+
+    for _, line in ipairs(record.lines) do
+        line.Color = espBoxColor
+        line.Transparency = 1
+    end
+
+    styleEspFillSegments(record)
+    styleEspText(record.nameText)
+    styleEspText(record.distanceText)
+end
+
+local function ensureEspLinePairs(record, count)
+    local created = false
+
+    while #record.lines < count do
+        local outline = newEspDrawing(record, "Line", 1)
+        outline.Thickness = 3
+        outline.Color = ESP_OUTLINE_COLOR
+        outline.From = Vector2.new(0, 0)
+        outline.To = Vector2.new(0, 0)
+        table.insert(record.lineOutlines, outline)
+
+        local line = newEspDrawing(record, "Line", 2)
+        line.Thickness = 1
+        line.Color = espBoxColor
+        line.From = Vector2.new(0, 0)
+        line.To = Vector2.new(0, 0)
+        table.insert(record.lines, line)
+        created = true
+    end
+
+    if created then
+        styleEspRecord(record)
+    end
+
+    return created
+end
+
+local function ensureEspFillSegments(record)
+    local created = false
+
+    while #record.fillSegments < ESP_FILL_SEGMENT_COUNT do
+        local segment = newEspDrawing(record, "Square", 0)
+        segment.Filled = true
+        segment.Color = espBoxColor
+        segment.Position = Vector2.new(0, 0)
+        segment.Size = Vector2.new(1, 1)
+        table.insert(record.fillSegments, segment)
+        created = true
+    end
+
+    if created then
+        styleEspRecord(record)
+    end
+
+    return created
+end
+
+local function ensureEspText(record, field)
+    local text = record[field]
+
+    if text then
+        return text
+    end
+
+    text = newEspDrawing(record, "Text", 3)
+    text.Center = true
+    text.Font = 2
+    text.Outline = true
+    text.OutlineColor = ESP_OUTLINE_COLOR
+    text.Color = espBoxColor
+    text.Size = ESP_TEXT_SIZE
+    text.Text = ""
+    text.Position = Vector2.new(0, 0)
+    record[field] = text
+    styleEspText(text)
+    return text
 end
 
 local function createEspRecord(otherPlayer)
@@ -614,49 +789,46 @@ local function createEspRecord(otherPlayer)
         return espRecords[otherPlayer]
     end
 
-    local outline
-    local box
+    local record = {
+        drawings = {},
+        visibleDrawings = {},
+        pendingVisibleDrawings = {},
+        lineOutlines = {},
+        lines = {},
+        fillSegments = {},
+    }
     local succeeded, failure = pcall(function()
-        outline = Drawing.new("Square")
-        outline.Visible = false
-        outline.Filled = false
-        outline.Thickness = 3
-        outline.Color = ESP_OUTLINE_COLOR
-        outline.Transparency = 1
-        outline.Position = Vector2.new(0, 0)
-        outline.Size = Vector2.new(1, 1)
+        record.outline = newEspDrawing(record, "Square", 1)
+        record.outline.Filled = false
+        record.outline.Thickness = 3
+        record.outline.Color = ESP_OUTLINE_COLOR
+        record.outline.Position = Vector2.new(0, 0)
+        record.outline.Size = Vector2.new(1, 1)
 
-        box = Drawing.new("Square")
-        box.Visible = false
-        box.Filled = false
-        box.Thickness = 1
-        box.Color = ESP_BOX_COLOR
-        box.Transparency = 1
-        box.Position = Vector2.new(0, 0)
-        box.Size = Vector2.new(1, 1)
+        record.box = newEspDrawing(record, "Square", 2)
+        record.box.Filled = false
+        record.box.Thickness = 1
+        record.box.Color = espBoxColor
+        record.box.Position = Vector2.new(0, 0)
+        record.box.Size = Vector2.new(1, 1)
+
+        styleEspRecord(record)
     end)
 
     if not succeeded then
-        removeEspDrawing(box)
-        removeEspDrawing(outline)
+        for _, drawing in ipairs(record.drawings) do
+            removeEspDrawing(drawing)
+        end
+
         warn("Failed to create ESP box: " .. tostring(failure))
         return nil
     end
 
-    pcall(function()
-        outline.ZIndex = 0
-        box.ZIndex = 1
-    end)
-
-    local record = {
-        outline = outline,
-        box = box,
-    }
     espRecords[otherPlayer] = record
     return record
 end
 
-local function projectCharacterBounds(camera, character)
+local function projectCharacterBounds(camera, character, includeProjectedCorners)
     local succeeded, boundingCFrame, boundingSize = pcall(
         character.GetBoundingBox,
         character
@@ -675,8 +847,9 @@ local function projectCharacterBounds(camera, character)
     local minimumY = math.huge
     local maximumX = -math.huge
     local maximumY = -math.huge
+    local projectedCorners = includeProjectedCorners and {} or nil
 
-    for _, corner in ipairs(ESP_BOUNDING_CORNERS) do
+    for index, corner in ipairs(ESP_BOUNDING_CORNERS) do
         local worldPosition = boundingCFrame:PointToWorldSpace(Vector3.new(
             halfSize.X * corner.X,
             halfSize.Y * corner.Y,
@@ -688,6 +861,9 @@ local function projectCharacterBounds(camera, character)
             return nil
         end
 
+        if projectedCorners then
+            projectedCorners[index] = Vector2.new(viewportPosition.X, viewportPosition.Y)
+        end
         minimumX = math.min(minimumX, viewportPosition.X)
         minimumY = math.min(minimumY, viewportPosition.Y)
         maximumX = math.max(maximumX, viewportPosition.X)
@@ -715,7 +891,340 @@ local function projectCharacterBounds(camera, character)
         return nil
     end
 
-    return Vector2.new(minimumX, minimumY), size
+    return Vector2.new(minimumX, minimumY), size, projectedCorners
+end
+
+local function clipEspLineBoundary(direction, distance, startRatio, endRatio)
+    if math.abs(direction) <= 0.000001 then
+        return distance >= 0, startRatio, endRatio
+    end
+
+    local ratio = distance / direction
+
+    if direction < 0 then
+        if ratio > endRatio then
+            return false, startRatio, endRatio
+        end
+
+        startRatio = math.max(startRatio, ratio)
+    else
+        if ratio < startRatio then
+            return false, startRatio, endRatio
+        end
+
+        endRatio = math.min(endRatio, ratio)
+    end
+
+    return true, startRatio, endRatio
+end
+
+local function clipLineToViewport(fromPoint, toPoint, viewportSize)
+    local deltaX = toPoint.X - fromPoint.X
+    local deltaY = toPoint.Y - fromPoint.Y
+    local startRatio = 0
+    local endRatio = 1
+    local accepted
+
+    accepted, startRatio, endRatio = clipEspLineBoundary(
+        -deltaX,
+        fromPoint.X,
+        startRatio,
+        endRatio
+    )
+
+    if not accepted then
+        return nil
+    end
+
+    accepted, startRatio, endRatio = clipEspLineBoundary(
+        deltaX,
+        viewportSize.X - fromPoint.X,
+        startRatio,
+        endRatio
+    )
+
+    if not accepted then
+        return nil
+    end
+
+    accepted, startRatio, endRatio = clipEspLineBoundary(
+        -deltaY,
+        fromPoint.Y,
+        startRatio,
+        endRatio
+    )
+
+    if not accepted then
+        return nil
+    end
+
+    accepted, startRatio, endRatio = clipEspLineBoundary(
+        deltaY,
+        viewportSize.Y - fromPoint.Y,
+        startRatio,
+        endRatio
+    )
+
+    if not accepted then
+        return nil
+    end
+
+    if startRatio == 0 and endRatio == 1 then
+        return fromPoint, toPoint
+    end
+
+    return Vector2.new(
+        fromPoint.X + deltaX * startRatio,
+        fromPoint.Y + deltaY * startRatio
+    ), Vector2.new(
+        fromPoint.X + deltaX * endRatio,
+        fromPoint.Y + deltaY * endRatio
+    )
+end
+
+local function showEspDrawing(record, drawing)
+    record.pendingVisibleDrawings[drawing] = true
+
+    if not record.visibleDrawings[drawing] then
+        drawing.Visible = true
+    end
+end
+
+local function finishEspRecord(record)
+    for drawing in pairs(record.visibleDrawings) do
+        if not record.pendingVisibleDrawings[drawing] then
+            drawing.Visible = false
+        end
+    end
+
+    local previouslyVisibleDrawings = record.visibleDrawings
+    record.visibleDrawings = record.pendingVisibleDrawings
+    record.pendingVisibleDrawings = previouslyVisibleDrawings
+end
+
+local function showEspLinePair(record, index, fromPoint, toPoint)
+    local outline = record.lineOutlines[index]
+    local line = record.lines[index]
+    outline.From = fromPoint
+    outline.To = toPoint
+    showEspDrawing(record, outline)
+    line.From = fromPoint
+    line.To = toPoint
+    showEspDrawing(record, line)
+end
+
+local function showEspFill(record, position, size)
+    if not espFillEnabled or getEspFillOpacity() <= 0 then
+        return
+    end
+
+    local fillWidth = size.X - 2
+    local fillHeight = size.Y - 2
+
+    if fillWidth <= 0 or fillHeight <= 0 then
+        return
+    end
+
+    local activeSegmentCount = math.min(
+        ESP_FILL_SEGMENT_COUNT,
+        math.max(1, math.floor(fillHeight))
+    )
+    local segmentCountChanged = record.fillActiveSegmentCount ~= activeSegmentCount
+    record.fillActiveSegmentCount = activeSegmentCount
+    local created = ensureEspFillSegments(record)
+
+    if segmentCountChanged and not created then
+        styleEspFillSegments(record)
+    end
+
+    local fillX = position.X + 1
+    local fillY = position.Y + 1
+
+    for index = 1, activeSegmentCount do
+        local segment = record.fillSegments[index]
+        local top = fillY + fillHeight * ((index - 1) / activeSegmentCount)
+        local bottom = fillY + fillHeight * (index / activeSegmentCount)
+
+        segment.Position = Vector2.new(fillX, top)
+        segment.Size = Vector2.new(fillWidth, bottom - top)
+        showEspDrawing(record, segment)
+    end
+end
+
+local function showEspBox(record, position, size)
+    record.outline.Position = position
+    record.outline.Size = size
+    showEspDrawing(record, record.outline)
+    record.box.Position = position
+    record.box.Size = size
+    showEspDrawing(record, record.box)
+end
+
+local function showEspCorners(record, position, size)
+    ensureEspLinePairs(record, 8)
+
+    local left = position.X
+    local top = position.Y
+    local right = left + size.X
+    local bottom = top + size.Y
+    local horizontalLength = math.min(size.X * 0.5, math.max(1, size.X * ESP_CORNER_SCALE))
+    local verticalLength = math.min(size.Y * 0.5, math.max(1, size.Y * ESP_CORNER_SCALE))
+
+    showEspLinePair(
+        record,
+        1,
+        Vector2.new(left, top),
+        Vector2.new(left + horizontalLength, top)
+    )
+    showEspLinePair(
+        record,
+        2,
+        Vector2.new(left, top),
+        Vector2.new(left, top + verticalLength)
+    )
+    showEspLinePair(
+        record,
+        3,
+        Vector2.new(right, top),
+        Vector2.new(right - horizontalLength, top)
+    )
+    showEspLinePair(
+        record,
+        4,
+        Vector2.new(right, top),
+        Vector2.new(right, top + verticalLength)
+    )
+    showEspLinePair(
+        record,
+        5,
+        Vector2.new(left, bottom),
+        Vector2.new(left + horizontalLength, bottom)
+    )
+    showEspLinePair(
+        record,
+        6,
+        Vector2.new(left, bottom),
+        Vector2.new(left, bottom - verticalLength)
+    )
+    showEspLinePair(
+        record,
+        7,
+        Vector2.new(right, bottom),
+        Vector2.new(right - horizontalLength, bottom)
+    )
+    showEspLinePair(
+        record,
+        8,
+        Vector2.new(right, bottom),
+        Vector2.new(right, bottom - verticalLength)
+    )
+end
+
+local function showEsp3DBox(record, projectedCorners, viewportSize)
+    ensureEspLinePairs(record, #ESP_3D_EDGES)
+
+    for index, edge in ipairs(ESP_3D_EDGES) do
+        local fromPoint, toPoint = clipLineToViewport(
+            projectedCorners[edge[1]],
+            projectedCorners[edge[2]],
+            viewportSize
+        )
+
+        if fromPoint then
+            showEspLinePair(record, index, fromPoint, toPoint)
+        end
+    end
+end
+
+local function measureEspTextHalfWidth(text, value)
+    local succeeded, width = pcall(function()
+        return text.TextBounds.X
+    end)
+
+    if not succeeded or type(width) ~= "number" or width <= 0 then
+        width = string.len(value) * ESP_TEXT_SIZE * ESP_TEXT_WIDTH_FACTOR
+    end
+
+    return width * 0.5
+end
+
+local function setEspTextValue(record, field, valueField, widthField, value)
+    local text = ensureEspText(record, field)
+
+    if record[valueField] ~= value then
+        record[valueField] = value
+        text.Text = value
+        record[widthField] = measureEspTextHalfWidth(text, value)
+    end
+
+    return text, record[widthField]
+end
+
+local function showEspText(record, text, halfWidth, centerX, y, viewportWidth)
+    local safeHalfWidth = math.min(halfWidth, viewportWidth * 0.5)
+    text.Position = Vector2.new(
+        math.clamp(centerX, safeHalfWidth, viewportWidth - safeHalfWidth),
+        y
+    )
+    showEspDrawing(record, text)
+end
+
+local function showEspPlayerInfo(record, otherPlayer, distance, position, size, viewportSize)
+    if not espNamesEnabled and not espDistanceEnabled then
+        return
+    end
+
+    local centerX = math.clamp(position.X + size.X * 0.5, 0, viewportSize.X)
+
+    if espNamesEnabled then
+        local nameText, nameHalfWidth = setEspTextValue(
+            record,
+            "nameText",
+            "nameTextValue",
+            "nameTextHalfWidth",
+            otherPlayer.Name
+        )
+        showEspText(
+            record,
+            nameText,
+            nameHalfWidth,
+            centerX,
+            math.clamp(
+                position.Y - ESP_TEXT_SIZE - ESP_TEXT_OFFSET,
+                0,
+                viewportSize.Y - ESP_TEXT_SIZE
+            ),
+            viewportSize.X
+        )
+    end
+
+    if espDistanceEnabled then
+        local roundedDistance = math.round(distance)
+        local distanceText = ensureEspText(record, "distanceText")
+
+        if record.distanceTextValue ~= roundedDistance then
+            record.distanceTextValue = roundedDistance
+            local distanceValue = tostring(roundedDistance) .. " studs"
+            distanceText.Text = distanceValue
+            record.distanceTextHalfWidth = measureEspTextHalfWidth(
+                distanceText,
+                distanceValue
+            )
+        end
+
+        showEspText(
+            record,
+            distanceText,
+            record.distanceTextHalfWidth,
+            centerX,
+            math.clamp(
+                position.Y + size.Y + ESP_TEXT_OFFSET,
+                0,
+                viewportSize.Y - ESP_TEXT_SIZE
+            ),
+            viewportSize.X
+        )
+    end
 end
 
 local function canShowEspPlayer(otherPlayer)
@@ -723,10 +1232,9 @@ local function canShowEspPlayer(otherPlayer)
         and (not espTeamCheckEnabled or not playersAreTeammates(otherPlayer))
 end
 
-local function updateEspRecord(camera, otherPlayer, record)
-    hideEspRecord(record)
-
+local function updateEspRecord(camera, distanceOrigin, otherPlayer, record)
     if not canShowEspPlayer(otherPlayer) then
+        hideEspRecord(record)
         return
     end
 
@@ -735,22 +1243,55 @@ local function updateEspRecord(camera, otherPlayer, record)
     local root = character and character:FindFirstChild("HumanoidRootPart")
 
     if not humanoid or humanoid.Health <= 0 or not root then
+        hideEspRecord(record)
         return
     end
 
-    local position, size = projectCharacterBounds(camera, character)
+    local distanceDelta = root.Position - distanceOrigin
+    local distanceSquared = distanceDelta.X * distanceDelta.X
+        + distanceDelta.Y * distanceDelta.Y
+        + distanceDelta.Z * distanceDelta.Z
+
+    if distanceSquared > espRenderDistanceSquared then
+        hideEspRecord(record)
+        return
+    end
+
+    local distance = espDistanceEnabled and math.sqrt(distanceSquared) or nil
+
+    local position, size, projectedCorners = projectCharacterBounds(
+        camera,
+        character,
+        espBoxStyle == "3D"
+    )
 
     if not position then
+        hideEspRecord(record)
         return
     end
 
+    table.clear(record.pendingVisibleDrawings)
     local succeeded = pcall(function()
-        record.outline.Position = position
-        record.outline.Size = size
-        record.box.Position = position
-        record.box.Size = size
-        record.outline.Visible = true
-        record.box.Visible = true
+        showEspFill(record, position, size)
+
+        if espBoxStyle == "Corner" then
+            showEspCorners(record, position, size)
+        elseif espBoxStyle == "3D" then
+            showEsp3DBox(record, projectedCorners, camera.ViewportSize)
+        else
+            showEspBox(record, position, size)
+        end
+
+        showEspPlayerInfo(
+            record,
+            otherPlayer,
+            distance,
+            position,
+            size,
+            camera.ViewportSize
+        )
+
+        finishEspRecord(record)
     end)
 
     if not succeeded then
@@ -768,11 +1309,28 @@ local function destroyAllEspRecords()
     espEnabled = false
 
     for _, record in pairs(espRecords) do
-        removeEspDrawing(record.box)
-        removeEspDrawing(record.outline)
+        for _, drawing in ipairs(record.drawings) do
+            removeEspDrawing(drawing)
+        end
     end
 
     table.clear(espRecords)
+end
+
+local function refreshEspStyles()
+    local failedPlayers = {}
+
+    for otherPlayer, record in pairs(espRecords) do
+        local succeeded = pcall(styleEspRecord, record)
+
+        if not succeeded then
+            table.insert(failedPlayers, otherPlayer)
+        end
+    end
+
+    for _, otherPlayer in ipairs(failedPlayers) do
+        destroyEspRecord(otherPlayer)
+    end
 end
 
 local function setEspEnabled(enabled)
@@ -808,8 +1366,16 @@ table.insert(mainConnections, RunService.RenderStepped:Connect(function()
         return
     end
 
+    local localCharacter = player.Character
+    local localHumanoid = localCharacter
+        and localCharacter:FindFirstChildOfClass("Humanoid")
+    local localRoot = localHumanoid
+        and localHumanoid.Health > 0
+        and localCharacter:FindFirstChild("HumanoidRootPart")
+    local distanceOrigin = localRoot and localRoot.Position or camera.CFrame.Position
+
     for otherPlayer, record in pairs(espRecords) do
-        updateEspRecord(camera, otherPlayer, record)
+        updateEspRecord(camera, distanceOrigin, otherPlayer, record)
     end
 end))
 
@@ -1585,7 +2151,7 @@ showWeaponChooserIfAllowed()
 window = Nephren:CreateWindow({
     Title = "Nephren",
     Size = Vector2.new(420, 300),
-    ToggleKey = Enum.KeyCode.RightShift,
+    ToggleKey = Enum.KeyCode.K,
 })
 
 local weaponTab = window:AddTab("Weapon")
@@ -1604,6 +2170,10 @@ local aimbotSection = aimbotTab:AddSection({
 local espSection = espTab:AddSection({
     Title = "Player ESP",
     Side = "Left",
+})
+local espDetailsSection = espTab:AddSection({
+    Title = "Player Info",
+    Side = "Right",
 })
 local configSelectionSection = configTab:AddSection({
     Title = "Configs",
@@ -1737,6 +2307,81 @@ espSection:AddToggle({
     Flag = "ESPTeamCheck",
     Callback = function(enabled)
         espTeamCheckEnabled = enabled
+    end,
+})
+
+espSection:AddDropdown({
+    Text = "Box Style",
+    Values = ESP_BOX_STYLES,
+    Default = espBoxStyle,
+    Flag = "ESPBoxStyle",
+    Callback = function(value)
+        espBoxStyle = value
+    end,
+})
+
+espSection:AddColorPicker({
+    Text = "Box Color",
+    Default = espBoxColor,
+    Flag = "ESPBoxColor",
+    Callback = function(color)
+        espBoxColor = color
+        refreshEspStyles()
+    end,
+})
+
+espSection:AddToggle({
+    Text = "Filled",
+    Default = espFillEnabled,
+    Flag = "ESPFillEnabled",
+    Callback = function(enabled)
+        espFillEnabled = enabled
+    end,
+})
+
+espSection:AddSlider({
+    Text = "Fill Transparency",
+    Min = 0,
+    Max = 100,
+    Step = 1,
+    Default = espFillTransparency,
+    Suffix = "%",
+    Flag = "ESPFillTransparency",
+    Callback = function(value)
+        espFillTransparency = value
+        refreshEspStyles()
+    end,
+})
+
+espDetailsSection:AddToggle({
+    Text = "Names",
+    Default = espNamesEnabled,
+    Flag = "ESPNamesEnabled",
+    Callback = function(enabled)
+        espNamesEnabled = enabled
+    end,
+})
+
+espDetailsSection:AddToggle({
+    Text = "Distance",
+    Default = espDistanceEnabled,
+    Flag = "ESPDistanceEnabled",
+    Callback = function(enabled)
+        espDistanceEnabled = enabled
+    end,
+})
+
+espDetailsSection:AddSlider({
+    Text = "Render Distance",
+    Min = MIN_ESP_RENDER_DISTANCE,
+    Max = MAX_ESP_RENDER_DISTANCE,
+    Step = 100,
+    Default = espRenderDistance,
+    Suffix = " studs",
+    Flag = "ESPRenderDistance",
+    Callback = function(value)
+        espRenderDistance = value
+        espRenderDistanceSquared = value * value
     end,
 })
 
