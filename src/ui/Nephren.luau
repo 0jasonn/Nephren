@@ -6859,7 +6859,7 @@ function StandaloneColorPicker:_layout(x, y, width)
 	self._window:_setTextPosition(
 		self._label,
 		self.Text,
-		Vector2.new(x, centeredTextY(y + 4, 14, self._window.Theme.TextSize))
+		Vector2.new(x, centeredTextY(y + 2, 14, self._window.Theme.TextSize))
 	)
 	self._addon:_layout(x + (self._rowWidth or width) - self._addon:_preferredWidth(), y)
 end
